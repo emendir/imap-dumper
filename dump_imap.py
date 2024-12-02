@@ -1,3 +1,4 @@
+import traceback
 import os
 import re
 import argparse
@@ -50,6 +51,38 @@ def fetch_uid(mail, num):
     return mail.fetch(num, '(UID)')
 
 
+def trim_file_name(filename: str, file_ext: str, output_dir: str) -> str:
+    """Shorten the given filename if it is too long for the filesystem.
+
+    Returns:
+        str: the filename without the extension
+    """
+    # Get the maximum file name length (in bytes) for the specified directory
+    max_length = os.pathconf(output_dir, 'PC_NAME_MAX')
+
+    # Encode filename and extension to UTF-8
+    filename_bytes = filename.encode('utf-8')
+    ext_bytes = file_ext.encode('utf-8')
+
+    # Calculate the available byte length for the main part of the filename
+    # Reserve space for extension and separator (e.g., '.')
+    max_main_bytes = max_length - len(ext_bytes) - 1
+
+    # Check if trimming is necessary
+    if len(filename_bytes) > max_main_bytes:
+        # Trim and decode safely, ensuring no character is split
+        filename_bytes = filename_bytes[:max_main_bytes]
+        while True:
+            try:
+                filename = filename_bytes.decode('utf-8')
+                break  # Success: valid UTF-8
+            except UnicodeDecodeError:
+                # Remove one more byte and try again
+                filename_bytes = filename_bytes[:-1]
+
+    return filename
+
+
 def process(mail, folder):
     rv, data = mail.search(None, 'ALL')
 
@@ -61,9 +94,9 @@ def process(mail, folder):
     if not os.path.isdir(args.local_folder):
         raise NotADirectoryError('Local folder not found.')
 
+    unknown_message_id_counter = 0  # counter for unknown email message IDs
     for num in data[0].split():
         output_dir = os.path.abspath(args.local_folder)
-
         rv, data = fetch_message(mail, num)
 
         if rv != 'OK':
@@ -74,39 +107,59 @@ def process(mail, folder):
         except:
             msg = email.message_from_string(data[0][1])
 
+        # try to extract email metadata
         subject = 'No subject'
         date = ''
-
+        message_id = ''
         try:
-            header = email.header.make_header(email.header.decode_header(msg['Subject']))
+            header = email.header.make_header(
+                email.header.decode_header(msg['Subject']))
 
             subject = str(header)
 
             date_tuple = email.utils.parsedate_tz(msg['Date'])
 
             if date_tuple:
-                datetime_ = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
+                datetime_ = datetime.fromtimestamp(
+                    email.utils.mktime_tz(date_tuple))
 
                 date = datetime_.strftime('%Y-%m-%d %H:%M:%S') + ' - '
+            message_id = msg['Message-ID']
         except:
             pass
 
+        # if metadata extraction failed, skip this email
+        if subject is None:
+            subject = "No Subject"
+        if not date:
+            date = "Unknown Date"
+        if not message_id:
+            unknown_message_id_counter += 1
+            message_id = str(unknown_message_id_counter)
+
+        # compose file name from date, message-ID and subject
+        # removing illegal filename-characters
         subject = re.sub(r'(\n|\r|\r\n|\")', '', subject)
         subject = re.sub(r'/', '-', subject).strip()
+        message_id = re.sub(r'(\<|\>|\$|\\|\/)', '', message_id)
 
-        file = date + re.sub(r'(\<|\>|\$)', '', msg['Message-ID']) + ' - ' + subject
-
-        print(Fore.BLUE + '\tWriting message at "' + file + '"... ', end='')
+        file = date + message_id + ' - ' + subject
+        FILENAME_EXT = "eml"
 
         final_dir = os.path.join(output_dir, folder.replace('"', ''))
-
         if not os.path.isdir(final_dir):
             os.makedirs(final_dir)
 
-        with open('{}/{}.eml'.format(final_dir, file), 'wb') as f:
+        # trim filename if it's too long
+        file = trim_file_name(file, FILENAME_EXT, final_dir)
+
+        print(Fore.BLUE + '\tWriting message at "' + file + '"... ', end='')
+
+        with open('{}/{}.{}'.format(final_dir, file, FILENAME_EXT), 'wb') as f:
             f.write(data[0][1])
 
-        print(Fore.GREEN + 'Done.', end='' if args.delete_remote is not None else '\n')
+        print(Fore.GREEN + 'Done.',
+              end='' if args.delete_remote is not None else '\n')
 
         if args.delete_remote is not None:
             delete(mail, num)
@@ -156,17 +209,25 @@ def main():
             for folder in remote_folders:
                 print(folder.decode().split(' "." ')[1])
             return
+        print(args.remote_folder)
+        if args.remote_folder == '*':
+            args.remote_folder = [folder.decode().split(
+                ' "." ')[1].lower() for folder in remote_folders]
+        else:
+            args.remote_folder = list(
+                map(lambda x: x.strip(), str(args.remote_folder).lower().split(',')))
 
-        if args.remote_folder != '*':
-            args.remote_folder = list(map(lambda x: x.strip(), str(args.remote_folder).lower().split(',')))
-
-            diff = list(set(args.remote_folder) - set(list(map(lambda x: x['lower'], remote_folders_map))))
+            diff = list(set(args.remote_folder) -
+                        set(list(map(lambda x: x['lower'], remote_folders_map))))
 
             if len(diff) > 0:
-                raise AttributeError('Remote folders not found: ' + ', '.join(diff))
-
+                raise AttributeError(
+                    'Remote folders not found: ' + ', '.join(diff))
+        print(args.remote_folder)
         for folder in args.remote_folder:
-            folder = [f for f in remote_folders_map if f['lower'] == folder][0]['original']
+            print(folder)
+            folder = [f for f in remote_folders_map if f['lower']
+                      == folder][0]['original']
 
             rv, data = mail.select(folder)
 
@@ -179,7 +240,9 @@ def main():
             else:
                 raise ConnectionError('Unable to open mailbox.', folder, rv)
     except BaseException as e:
-        print(Back.RED + Fore.BLACK + '[ERROR]' + Style.RESET_ALL, Fore.RED + type(e).__name__, str(e.args))
+        traceback.print_exc()
+        print(Back.RED + Fore.BLACK +
+              '[ERROR]' + Style.RESET_ALL, Fore.RED + type(e).__name__, str(e.args))
     finally:
         mail.logout()
 
